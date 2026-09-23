@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>メモ取るくん v1.0.0</title>
+  <title>メモ取るくん v1.1.0</title>
   <style>
     body { font-family: sans-serif; margin: 12px; background: #f8f9fa; color: #333; }
     .header { text-align: center; margin-bottom: 4px; }
@@ -71,7 +71,7 @@
 <body>
 
   <div class="header">
-    <h2>📝 メモ取るくん <span class="version-tag">v1.0.0</span></h2>
+    <h2>📝 メモ取るくん <span class="version-tag">v1.1.0</span></h2>
   </div>
   <div class="sync-status" id="syncStatus">🔄 クラウド同期中...</div>
 
@@ -128,8 +128,9 @@
 
   <script>
     const GAS_API_URL = "https://script.google.com/macros/s/AKfycbybM81cxMaEMJ4llR-wuZnrYCubGmy-YH8lML2OHYB0cjE_L_ZRM_iuXgshTnLTXnRq8Q/exec";
-    const STORAGE_KEY = 'memotorukun_cloud_events';
+    const STORAGE_KEY = 'memotorukun_cloud_events_v110';
 
+    // 内部では削除済み（isDeleted: true）も含めて保持する
     let memos = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
     let openedMemoIds = new Set();
 
@@ -157,7 +158,43 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(memos));
     }
 
-    /* クラウド同期（読み込み：JSONP方式でCORS回避） */
+    /* 🛡️ IDベースの双方向マージ同期 */
+    function mergeData(cloudData) {
+      const memoMap = new Map();
+
+      // 1. ローカル端末内のデータをまずマップにセット
+      memos.forEach(m => {
+        if (m.id) memoMap.set(m.id, m);
+      });
+
+      // 2. クラウド側のデータを突合・比較マージ
+      let hasLocalChanges = false;
+      cloudData.forEach(cloudItem => {
+        const localItem = memoMap.get(cloudItem.id);
+        if (!localItem) {
+          // ローカルに存在しないメモ ➔ クラウドから取り込む
+          memoMap.set(cloudItem.id, cloudItem);
+        } else {
+          // 両方にある場合 ➔ updatedAt（更新日時）が新しい方を採用
+          const cloudTime = new Date(cloudItem.updatedAt || 0).getTime();
+          const localTime = new Date(localItem.updatedAt || 0).getTime();
+
+          if (cloudTime > localTime) {
+            memoMap.set(cloudItem.id, cloudItem);
+          } else if (localTime > cloudTime) {
+            // ローカル側が新しければ、後でクラウドへ反映させる
+            hasLocalChanges = true;
+          }
+        }
+      });
+
+      // マージ結果を反映
+      memos = Array.from(memoMap.values());
+      saveToLocalStorage();
+      return hasLocalChanges;
+    }
+
+    /* クラウド同期（読み込み：マージ方式） */
     function syncFromCloud() {
       if (!GAS_API_URL || GAS_API_URL.includes("ここに")) {
         setStatus("⚠️ GASのURLが未設定です（ローカル保存中）");
@@ -169,15 +206,16 @@
       const oldScript = document.getElementById('gas-jsonp');
       if (oldScript) oldScript.remove();
 
-      window.handleGasResponse = function(cloudData) {
+      window.handleGasResponse = async function(cloudData) {
         if (Array.isArray(cloudData)) {
-          memos = cloudData.map(item => ({
-            ...item,
-            id: item.id || generateId()
-          }));
-          saveToLocalStorage();
+          const hasLocalNewer = mergeData(cloudData);
           setStatus("✅ クラウド同期完了");
           render();
+
+          // ローカル側でオフライン中に追加・変更・削除したメモがあれば自動でクラウドにも送信
+          if (hasLocalNewer) {
+            await syncToCloud();
+          }
         } else {
           setStatus("⚠️ データ形式エラー");
           render();
@@ -188,13 +226,13 @@
       script.id = 'gas-jsonp';
       script.src = `${GAS_API_URL}?callback=handleGasResponse&t=${Date.now()}`;
       script.onerror = function() {
-        setStatus("⚠️ 同期オフライン（ローカルデータを表示）");
+        setStatus("⚠️ オフライン（ローカルデータのみで安全に動作中）");
         render();
       };
       document.body.appendChild(script);
     }
 
-    /* クラウド同期（書き込み：POST送信） */
+    /* クラウド同期（書き込み：全レコードの状態を送信） */
     async function syncToCloud() {
       if (!GAS_API_URL || GAS_API_URL.includes("ここに")) return;
       setStatus("☁️ クラウドへ保存中...");
@@ -221,11 +259,13 @@
       render();
     }
 
+    /* 画面描画（削除マーク isDeleted: true のメモは除外して表示） */
     function render() {
       const listEl = document.getElementById('itemList');
       listEl.innerHTML = '';
 
-      let displayMemos = [...memos];
+      // 削除されていないメモだけを画面に表示
+      let displayMemos = memos.filter(m => !m.isDeleted);
       const sortType = document.getElementById('sortType').value;
       const colorOrder = { 'blue': 1, 'red': 2, 'green': 3, 'orange': 4, 'purple': 5 };
 
@@ -290,10 +330,11 @@
           target.content = content;
           target.color = color;
           target.updatedAt = now;
+          target.isDeleted = false;
         }
       } else {
         const id = generateId();
-        memos.push({ id, title, content, color, updatedAt: now });
+        memos.push({ id, title, content, color, updatedAt: now, isDeleted: false });
         openedMemoIds.add(id);
       }
 
@@ -332,9 +373,14 @@
       document.getElementById('formBox').classList.remove('editing');
     }
 
+    /* 🛡️ 論理削除：配列から消さずに isDeleted: true を付与 */
     async function delItem(id) {
       if (confirm('このメモを削除しますか？')) {
-        memos = memos.filter(m => m.id !== id);
+        const target = memos.find(m => m.id === id);
+        if (target) {
+          target.isDeleted = true;
+          target.updatedAt = new Date().toISOString();
+        }
         openedMemoIds.delete(id);
         saveToLocalStorage();
         if (document.getElementById('editId').value === id) {
@@ -346,7 +392,8 @@
     }
 
     function exportCSV() {
-      if (memos.length === 0) {
+      const activeMemos = memos.filter(m => !m.isDeleted);
+      if (activeMemos.length === 0) {
         alert('エクスポートするデータがありません');
         return;
       }
@@ -354,7 +401,7 @@
       const headers = ['id', 'title', 'content', 'color', 'updatedAt'];
       const rows = [headers.join(',')];
 
-      memos.forEach(m => {
+      activeMemos.forEach(m => {
         const safeId = `"${(m.id || '').replace(/"/g, '""')}"`;
         const safeTitle = `"${(m.title || '').replace(/"/g, '""')}"`;
         const safeContent = `"${(m.content || '').replace(/"/g, '""')}"`;
@@ -431,7 +478,8 @@
               title: title,
               content: content,
               color: color,
-              updatedAt: updatedAt
+              updatedAt: updatedAt,
+              isDeleted: false
             });
           }
         }
@@ -449,7 +497,7 @@
       reader.readAsText(file);
     }
 
-    // 初回描画とクラウドからのデータ取得
+    // 初回描画とクラウドマージ同期
     render();
     syncFromCloud();
   </script>
